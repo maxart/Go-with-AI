@@ -4,7 +4,7 @@ _Origin: https://github.com/maxart/Go-with-AI — check upstream for newer versi
 
 ## Identity
 
-You are working on a production Go backend service — typically an HTTP/gRPC API or worker that runs on AWS (Lambda, ECS Fargate, EKS, or EC2). Follow modern best practices (2025-2026, Go 1.24+). Write clean, idiomatic, type-safe, secure code that scales horizontally. Prioritize correctness, clarity, observability, and operational simplicity. Don't over-engineer. Go rewards small, sharp, boring code.
+You are working on a production Go backend service — typically an HTTP/gRPC API or worker that runs on AWS (Lambda, ECS Fargate, EKS, or EC2), or on an NVIDIA-GPU host (EC2 G/P-family, EKS with the GPU Operator, NVIDIA DGX Cloud, NVIDIA Cloud Functions). Follow modern best practices (2025-2026, Go 1.24+). Write clean, idiomatic, type-safe, secure code that scales horizontally. Prioritize correctness, clarity, observability, and operational simplicity. Don't over-engineer. Go rewards small, sharp, boring code.
 
 ---
 
@@ -39,24 +39,20 @@ You are working on a production Go backend service — typically an HTTP/gRPC AP
 
 ### Modules, Generics, Iterators
 
-- One `go.mod` per module at the repo root; `go 1.24` (or current min) directive matches CI. `toolchain go1.24.3` only when reproducibility matters. `go mod tidy` before every commit; commit `go.sum`. Never edit `require` lines by hand — `go get pkg@version`. One major bump per PR.
-- Imports grouped: stdlib / third-party / local, blank-line separated (`goimports` enforces).
-- Prefer concrete types in signatures. Generics (`[T any]`, `[T Ordered]`) only when you'd otherwise duplicate code or use `any`. Never generic-ify for "future flexibility". `any` always (not `interface{}`) in new code.
-- Range-over-function iterators (1.23+) for streaming/lazy sequences only. Plain slices + `for i := range s` for collections.
-- Defined types (`type UserID string`) over aliases (`type Foo = Bar`) for new domain types — real type safety, `UserID` distinct from `OrderID`.
+- One `go.mod` per module at repo root; `go 1.24`+ directive matches CI. `go mod tidy` before every commit; commit `go.sum`. Never edit `require` by hand — `go get pkg@version`. One major bump per PR. Imports grouped: stdlib / third-party / local, blank-line separated (`goimports`).
+- Concrete types in signatures. Generics only when you'd otherwise duplicate code or use `any`. Never generic-ify for "future flexibility". Use `any`, not `interface{}`. Range-over-function iterators (1.23+) for streaming only; plain slices for collections. Defined types (`type UserID string`) over aliases for new domain types.
 
 ### Errors
 
-- Return errors, don't panic. Wrap with `%w`: `fmt.Errorf("get user %s: %w", id, err)`. Never `%v` for the inner error (loses `errors.Is`/`As` chain).
-- Sentinel errors (`var ErrNotFound = errors.New("not found")`) for known failures, check with `errors.Is`. Custom error types when callers need fields, check with `errors.As`. Don't compare `err.Error()` strings.
+- Wrap with `%w`: `fmt.Errorf("get user %s: %w", id, err)`. Never `%v` for inner errors (loses chain). Sentinel errors (`var ErrNotFound = errors.New(...)`) checked with `errors.Is`; custom error types checked with `errors.As`. Don't compare `err.Error()` strings.
 - Don't `if err != nil { return err }` blindly — add context unless the immediate caller will. `errors.Join` (1.20+) for aggregation. Never swallow — `_ = x.Close()` is a smell.
-- `panic`/`recover` only at process boundaries (HTTP middleware turning panics into 500s, `main` recovery). Never use `panic` for control flow. `log.Fatal` only in `main`.
+- `panic`/`recover` only at process boundaries (HTTP middleware turning panics into 500s, `main` recovery). Never for control flow. `log.Fatal` only in `main`.
 
 ### Pointers, Slices, Maps, Defer
 
-- Pointers when: value is large, you need to mutate, type has a mutex, nil is meaningful. Otherwise pass by value — escape analysis is good, value semantics are safer.
-- Slices: nil is valid for read; `make([]T, 0, cap)` when capacity is known. `s2 := s1[2:5]` aliases the backing array — `slices.Clone` to detach.
-- Maps: no concurrent writes without `sync.Mutex` (or `sync.Map` when keys stable + reads dominate). Iteration order randomized — don't depend on it.
+- Pointers when value is large, you need to mutate, type has a mutex, or nil is meaningful. Otherwise pass by value — escape analysis is good, value semantics are safer.
+- Slices: nil is valid for read; `make([]T, 0, cap)` when capacity known. Slicing aliases the backing array — `slices.Clone` to detach.
+- Maps: no concurrent writes without `sync.Mutex` (or `sync.Map` when keys stable + reads dominate). Iteration order randomized.
 - `defer` for cleanup at the top of the function after acquiring the resource. Defers in loops accumulate — close inline or factor out.
 
 ---
@@ -121,15 +117,12 @@ func (a *API) handleGetUser(w http.ResponseWriter, r *http.Request) {
 
 ## Context, Concurrency, Cancellation
 
-- **First parameter of every blocking/I/O function is `ctx context.Context`.** Pass it through; never store in a struct field (lint rule: `containedctx`). Never pass `context.Background()` from a handler — use `r.Context()`.
-- Use `context.WithTimeout`/`WithDeadline` at the boundary where you decide the budget (handler entry, outbound call, DB query). Always `defer cancel()`. Don't add per-call timeouts inside library code — let the caller decide.
-- `ctx.Done()` for cancellation; check `ctx.Err()` after `select`. `context.Cause(ctx)` (1.20+) returns the underlying cancel reason — log this, not just `ctx.Err()`.
-- `context.WithValue` only for request-scoped data that crosses API boundaries (request ID, auth principal, trace span). Never for optional function arguments. Use unexported key types: `type ctxKey int`.
-- **Goroutines**: every goroutine must have an obvious termination path. Naked `go fn()` in a long-running service is a leak waiting to happen.
-- Use `golang.org/x/sync/errgroup` for parallel work that should fail-fast: `g, gctx := errgroup.WithContext(ctx); g.Go(func() error { ... })`; first non-nil error cancels `gctx` and is returned by `g.Wait()`.
-- `sync.WaitGroup` only when you don't need error aggregation. `sync.Mutex` for simple shared state; `sync.RWMutex` only if reads vastly dominate (measure first). Prefer channels for handoff, mutexes for state.
-- Channel rules: the **sender** closes (closing a closed channel panics). Buffered channels for hand-off (`chan T, n`); unbuffered for synchronization. Never `nil` channel in `select` unless you mean "disable this case".
-- Run `go test -race ./...` in CI. The race detector catches data races deterministically — treat any `WARNING: DATA RACE` as a release blocker.
+- **First parameter of every blocking / I/O function is `ctx context.Context`.** Pass it through; never store in a struct (lint: `containedctx`). In handlers use `r.Context()` — never `context.Background()`.
+- `context.WithTimeout` / `WithDeadline` at the boundary where you decide the budget (handler entry, outbound call, DB query). Always `defer cancel()`. Don't add per-call timeouts inside library code — let callers decide.
+- Check `ctx.Err()` after `select`. `context.Cause(ctx)` (1.20+) returns the underlying reason — log that. `context.WithValue` only for request-scoped data crossing API boundaries (request ID, principal, trace span); never for optional args; use unexported key types (`type ctxKey int`).
+- **Goroutines** must have an obvious termination path. Naked `go fn()` in a long-running service is a leak. Use `golang.org/x/sync/errgroup` for parallel work that should fail-fast: first non-nil error cancels the group context and is returned by `Wait()`. `sync.WaitGroup` only when you don't need error aggregation. Prefer channels for handoff, mutexes for state. `sync.RWMutex` only when reads vastly dominate (measure first).
+- Channel rules: the **sender** closes (closing a closed channel panics). Buffered for hand-off; unbuffered for sync. `nil` channel in `select` is never selected.
+- `go test -race ./...` in CI. Any `WARNING: DATA RACE` is a release blocker.
 
 ---
 
@@ -159,15 +152,13 @@ func (s *PgStore) GetByID(ctx context.Context, id uuid.UUID) (User, error) {
 
 ## AWS SDK for Go v2
 
-- **Always v2** (`github.com/aws/aws-sdk-go-v2/...`). v1 reached end-of-support **July 31, 2025** — do not start anything new on it; migrate any v1 holdouts.
-- Load config once at startup: `cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))`. Reuse one `aws.Config` to construct service clients (`s3.NewFromConfig(cfg)`, `dynamodb.NewFromConfig(cfg)`). Service clients are **safe for concurrent use** — keep them as singletons.
-- **Credentials**: never put access keys in env vars or files in containers. Use IAM roles — task role on ECS/Fargate, execution role on Lambda, IRSA on EKS, instance profile on EC2. The default credential chain finds them automatically.
-- **Region**: take from `AWS_REGION` env var (set by Lambda/ECS automatically); fail-fast if unset for non-AWS environments.
-- Pass `ctx` to every API call: `out, err := s3.GetObject(ctx, &s3.GetObjectInput{...})`. Honor cancellation.
-- Configure retries: `config.WithRetryMaxAttempts(5)` and `config.WithRetryMode(aws.RetryModeAdaptive)` for high-throughput workloads (token-bucket prevents overload). Default standard mode is fine for most services.
-- Use **paginators** (`s3.NewListObjectsV2Paginator(client, input)`) — never hand-roll `NextToken` loops. They handle pagination, retries, and context cancellation correctly.
-- **Endpoint resolution**: don't override `BaseEndpoint` outside tests / LocalStack. For LocalStack/Minio, use the per-client option: `s3.NewFromConfig(cfg, func(o *s3.Options){ o.BaseEndpoint = aws.String(endpoint); o.UsePathStyle = true })`.
-- Don't bake **AWS account-specific** ARNs into code — pass via env. Don't log raw responses (may contain PII or credentials in headers).
+- **Always v2** (`github.com/aws/aws-sdk-go-v2/...`). v1 reached end-of-support **July 31, 2025** — migrate any v1 holdouts; don't start anything new on it.
+- Load config once at startup: `cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))`. Reuse one `aws.Config` to construct service clients. Service clients are safe for concurrent use — keep as singletons.
+- **Credentials**: never access keys in env vars or files in containers. Use IAM roles — task role (ECS/Fargate), execution role (Lambda), IRSA (EKS), instance profile (EC2). The default credential chain finds them.
+- **Region** from `AWS_REGION` env (set automatically on Lambda/ECS); fail-fast if unset elsewhere. Pass `ctx` to every API call. Configure retries (`config.WithRetryMaxAttempts(5)`, adaptive mode for high-throughput).
+- Use **paginators** (`s3.NewListObjectsV2Paginator(client, input)`) — never hand-roll `NextToken` loops.
+- Don't override `BaseEndpoint` outside tests / LocalStack. For LocalStack/Minio: per-client `o.BaseEndpoint = aws.String(endpoint)` and `o.UsePathStyle = true` for S3.
+- Don't bake account-specific ARNs into code — pass via env. Don't log raw responses (PII / credentials in headers).
 
 ---
 
@@ -185,13 +176,36 @@ func (s *PgStore) GetByID(ctx context.Context, id uuid.UUID) (User, error) {
 
 ## AWS ECS / Fargate
 
-- One process per container. **Multi-stage Dockerfile**: stage 1 compiles; stage 2 `FROM scratch` (or `gcr.io/distroless/static-debian12:nonroot`) with the binary + `ca-certificates`. Image < 20 MB. Build with `CGO_ENABLED=0 GOOS=linux GOARCH=arm64` and run on Graviton (`runtimePlatform: { cpuArchitecture: ARM64 }`).
+- One process per container. **Multi-stage Dockerfile**: stage 1 compiles; stage 2 `FROM scratch` (or `gcr.io/distroless/static-debian12:nonroot`) with the binary + `ca-certificates`. Image < 20 MB. Build with `CGO_ENABLED=0 GOOS=linux GOARCH=arm64` and run on Graviton (`runtimePlatform: { cpuArchitecture: ARM64 }`). **Fargate has no GPUs** — for GPU workloads use ECS-on-EC2 or EKS with the GPU Operator (see GPU section).
 - Listen on `PORT` env (default 8080), bind `0.0.0.0`. **Graceful shutdown**: ECS sends `SIGTERM` then waits `stopTimeout` (default 30s; set 30-60s) before `SIGKILL`. Trap, stop accepting, drain in-flight, close DB pools, return.
 - Health checks: `/healthz` 200 with no DB hit (liveness — only fails if hung). `/readyz` checks DB ping + critical deps (fails when overloaded). Map ALB target group to `/readyz`.
 - **IAM Task Role** (app's AWS calls) vs **Execution Role** (ECS pulling image, writing logs, fetching secrets) — distinct, least privilege. Don't reuse.
 - Config via env vars sourced from Secrets Manager / Parameter Store via the task definition (`secrets: [{ name, valueFrom: arn:... }]`). Don't bake secrets in the image. Don't fetch per request — read once at startup.
 - Logs: JSON to stdout; `awslogs` driver ships to CloudWatch. For high-volume use FireLens + Fluent Bit → S3/OpenSearch/Kinesis.
 - **Fargate Spot** for interruption-tolerant workloads (batch, async workers); on-demand for user-facing. Always tolerate sudden termination. Autoscale on the right signal: CPU/mem for compute-bound; SQS depth for workers; ALB request count or target response time for HTTP. Min capacity ≥ 2 across AZs.
+
+---
+
+## CPU Architecture (arm64 vs amd64)
+
+- **Default `arm64`** (Graviton2/3 on AWS) for pure-Go services — ~20% cheaper, ~19% faster. Cross-compile from any host with `GOOS=linux GOARCH=arm64 CGO_ENABLED=0`. No emulation.
+- **Choose `amd64`** when **any** of: a CGO dep lacks arm64 wheels; the workload uses CUDA / NVIDIA GPUs (drivers + ecosystem are amd64-first); a hot path needs AVX-512 / AMX; customer / on-prem constraint is x86-only.
+- **Multi-arch images** (`docker buildx --platform linux/amd64,linux/arm64`) only when consumers genuinely need both. Otherwise single-arch is simpler and faster to build. CGO multi-arch under buildx uses QEMU (slow); prefer native runners per arch in CI.
+- Pin the arch in the task / Dockerfile / build script — implicit choices break when the host changes (Apple Silicon dev → x86 CI → Graviton prod is a common bug surface).
+
+---
+
+## GPU and NVIDIA Workloads
+
+Go is the **service layer**, not the inference engine. Python (or C++) does the GPU math; Go handles routing, validation, auth, batching, observability, and quota in front of it. Don't call CUDA from Go.
+
+- **Talk to inference servers over gRPC.** NVIDIA Triton, TGI, vLLM, NIM, and most serving stacks expose gRPC — generate a Go client from the `.proto` (`protoc --go_out --go-grpc_out`). For HTTP-only servers (Ollama, OpenAI-compatible), wrap `*http.Client` with `otelhttp.NewTransport`. **NIM** (NVIDIA Inference Microservices) is packaged-model containers with an OpenAI-compatible REST API — treat as any HTTP API, generous timeouts, stream where supported.
+- **Hosting**: **NVCF** (NVIDIA Cloud Functions) for serverless GPU inference (pay per invocation, good for bursty); **DGX Cloud** for managed multi-tenant GPU clusters via hyperscaler partners; **EC2 G5/G6/P4/P5 + ECS-on-EC2 or EKS** for self-managed; **CoreWeave / Lambda Labs / RunPod** often cheapest raw GPU. **Fargate has no GPUs.** **EKS + NVIDIA GPU Operator** (itself in Go) is the standard Kubernetes pattern: pods request `nvidia.com/gpu: 1`, operator handles drivers / toolkit / MIG / monitoring.
+- **Container images**: Go services that only **call** GPU servers stay on **distroless** — no GPU base image needed. Only the inference container needs `nvcr.io/nvidia/cuda:*-base-ubuntu*` and the `--gpus` / `nvidia.com/gpu` resource.
+- **Architecture**: GPU hosts are predominantly **amd64** in AWS / Azure / GCP. CUDA-on-arm64 is mature on Jetson and Grace Hopper but lags broadly. Default `GOARCH=amd64` for binaries that run on GPU hosts or link CUDA libs.
+- **CUDA via CGO is almost always wrong** — build complexity, race detector / pprof / delve degrade, Python ships CUDA features quarters faster, you lose the single static binary. Talk to a separate Python/C++ inference process over gRPC instead.
+- **Observability**: scrape **DCGM** via `dcgm-exporter` (Prometheus format) — utilization, framebuffer, SM activity, power, temperature. Sidecar (ECS) or DaemonSet (EKS). Correlate with Go-side OTel traces by tagging spans with model name + version. Track cost-per-inference (request count × hourly GPU cost / GPU count).
+- **Don't** auto-scale GPU instances aggressively — they cost 10-100x CPU per hour. Set min ≥ 1, max conservative, scale on queue depth or p95 latency, long cooldowns. Prefer **batching at the Go layer** (5-50 ms accumulation → single batched gRPC call) before adding GPU capacity.
 
 ---
 
@@ -207,44 +221,42 @@ func (s *PgStore) GetByID(ctx context.Context, id uuid.UUID) (User, error) {
 
 ## Logging (slog)
 
-- Use `log/slog` (stdlib, 1.21+). **JSON handler in production** (`slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})`); text handler locally.
-- Set the package-level logger once in `main`, then pass it down (`type Service struct { logger *slog.Logger }`) — don't use the global `slog.Default()` in libraries.
-- Always `*Context` variants from a handler/request: `logger.InfoContext(ctx, "user fetched", "user_id", id, "duration_ms", ms)`. Lets handlers attach trace IDs via a custom `Handler` and gives the OTel bridge the trace context.
-- Use **key-value attribute pairs**, not formatted strings: `slog.Info("user fetched", "user_id", id)` not `slog.Info(fmt.Sprintf("user %s fetched", id))`. JSON handler can index attributes; formatted strings can't.
-- Levels: `Debug` for dev-only detail, `Info` for normal operations, `Warn` for recoverable anomalies, `Error` for genuine failures. **Don't `Error` everything** — pages will be ignored.
-- **Redact secrets** via `LogValuer` interface or `ReplaceAttr` in `HandlerOptions`. Tokens, passwords, PII (email, SSN), card numbers — never raw in logs. Bridge to OpenTelemetry with `go.opentelemetry.io/contrib/bridges/otelslog` so logs carry trace IDs and ship to your APM.
-- `slog.Default()` is fine for `main` and tests; for services, inject the logger.
+- Use `log/slog` (stdlib, 1.21+). **JSON handler in production**; text handler locally. Set the package logger in `main`; pass it down (`type Service struct { logger *slog.Logger }`). Don't use global `slog.Default()` in libraries.
+- Always `*Context` variants from a handler/request: `logger.InfoContext(ctx, "user fetched", "user_id", id, "duration_ms", ms)` — lets a custom handler attach request/trace IDs, and the OTel bridge correlates logs to traces.
+- **Key-value attribute pairs**, not formatted strings: `slog.Info("user fetched", "user_id", id)`, not `slog.Info(fmt.Sprintf(...))`. JSON handler indexes attrs; formatted strings can't be queried.
+- Levels: `Debug` dev-only, `Info` normal ops, `Warn` recoverable anomalies, `Error` genuine failures. **Don't `Error` everything** — pages get ignored.
+- **Redact secrets** via `LogValuer` or `ReplaceAttr`. Tokens, passwords, PII, card numbers — never raw. Bridge to OpenTelemetry with `otelslog` so logs carry trace IDs.
 
 ---
 
 ## Observability (OpenTelemetry, ADOT)
 
-- Use **OpenTelemetry** for traces, metrics, and (increasingly) logs. AWS X-Ray now ingests OTLP — use **AWS Distro for OpenTelemetry (ADOT)** as the collector. Don't use the X-Ray SDK directly for new code; X-Ray is transitioning to OTel.
-- Initialize a `TracerProvider` and `MeterProvider` at startup; `defer shutdown()` to flush. Set the OTLP exporter endpoint to the ADOT collector sidecar (`localhost:4317` gRPC or `:4318` HTTP).
-- Auto-instrument: `otelhttp.NewHandler(mux, "api")` for the HTTP server, `otelhttp.NewTransport(http.DefaultTransport)` for the client, `otelpgx` for pgx, `otelaws` for AWS SDK v2. These add spans, propagate trace context, and emit standard semantic-convention attributes.
-- Manual spans for business operations: `ctx, span := tracer.Start(ctx, "user.create"); defer span.End()`. Attach attributes (`span.SetAttributes(attribute.String("user.id", id.String()))`); record errors (`span.RecordError(err); span.SetStatus(codes.Error, err.Error())`).
-- Metrics that pay for themselves on every service: HTTP request duration histogram (route, method, status), inflight requests gauge, DB query duration histogram, downstream RPC latency, business counters (orders, signups). Don't paper over missing logs with metrics or vice versa.
-- **ECS deployment**: ADOT collector as a sidecar container in the same task definition. **Lambda**: ADOT as a Lambda layer. Both forward to X-Ray, CloudWatch Metrics, Prometheus, or OTLP-compatible backends (Datadog, Honeycomb, New Relic, Grafana).
-- Tag traces and metrics with deployment metadata (service name, version, env, region, AZ) via OTel `Resource`. Sample at 1-10% in prod for high-traffic services; always-on for low-traffic.
+- Use **OpenTelemetry** for traces, metrics, and (increasingly) logs. AWS X-Ray now ingests OTLP — use **AWS Distro for OpenTelemetry (ADOT)** as the collector. Don't use the X-Ray SDK for new code; X-Ray is transitioning to OTel.
+- Init `TracerProvider` + `MeterProvider` at startup; `defer shutdown()` to flush. OTLP exporter → ADOT collector sidecar (`localhost:4317` gRPC or `:4318` HTTP).
+- Auto-instrument: `otelhttp.NewHandler(mux, "api")` server + `otelhttp.NewTransport` client; `otelpgx` for pgx; `otelaws` for AWS SDK v2. Adds spans, propagates trace context, emits standard semantic-convention attributes.
+- Manual spans for business operations: `ctx, span := tracer.Start(ctx, "user.create"); defer span.End()`. Attach attributes; record errors (`span.RecordError(err); span.SetStatus(codes.Error, ...)`).
+- Baseline metrics: HTTP request duration histogram (route, method, status), inflight requests gauge, DB query duration histogram, downstream RPC latency, business counters. Don't paper over missing logs with metrics or vice versa.
+- **ECS**: ADOT collector as sidecar in the task definition. **Lambda**: ADOT as a layer. Forwards to X-Ray, CloudWatch Metrics, Prometheus, or any OTLP backend (Datadog, Honeycomb, New Relic, Grafana).
+- Tag traces / metrics with deployment metadata (service, version, env, region, AZ) via OTel `Resource`. Sample 1-10% in prod for high-traffic; always-on for low-traffic.
 
 ---
 
 ## Validation and Input Handling
 
-- Validate at the **edge** (HTTP handler / Lambda handler / SQS consumer). Reject early, return 400 with a clear shape — never let bad input reach the service layer.
-- Define request structs adjacent to the handler (`type createUserRequest struct { Email string \`json:"email"\` }`); validate with `go-playground/validator` (struct tags) or hand-rolled functions for one-off rules. For complex domain validation, expose a `Validate() error` method on the request.
-- Constrain sizes: max body size via `http.MaxBytesReader`; max string length checked explicitly. Untrusted strings into URLs / SQL / shell / templates always escaped (Go's `html/template`, `net/url.QueryEscape`, parameterized SQL, never `os/exec` with shell strings).
-- Treat **all** external input as untrusted: HTTP bodies, query/path params, headers, cookies, env vars in pipelines, S3 object contents, SQS message bodies. Trust nothing, validate everything.
+- Validate at the **edge** (HTTP / Lambda / SQS consumer). Reject early, return 400 with a clear shape — never let bad input reach the service layer.
+- Request structs adjacent to the handler; validate with `go-playground/validator` (struct tags) or hand-rolled functions. Complex domain validation: expose a `Validate() error` method.
+- Constrain sizes: body via `http.MaxBytesReader`; string length checked explicitly. Untrusted strings into URLs / SQL / shell / templates always escaped (`html/template`, `net/url.QueryEscape`, parameterized SQL, never `os/exec` with shell strings).
+- Treat **all** external input as untrusted: HTTP bodies, query / path params, headers, cookies, env vars in pipelines, S3 object contents, SQS message bodies.
 
 ---
 
 ## Error Handling Patterns
 
-- Wrap errors with **context** at each layer: `fmt.Errorf("user.GetByID id=%s: %w", id, err)`. Top of the call stack should produce a debuggable chain.
-- Map errors to status / response in the **handler** layer via `errors.Is`/`errors.As`. Service and repository layers don't know about HTTP — they return domain or wrapped errors.
-- Sentinel errors at package boundaries (`var ErrNotFound = errors.New("not found")`) — callers test with `errors.Is`. Custom error types when callers need fields (`var verr *ValidationError; if errors.As(err, &verr) { ... }`).
+- Wrap errors with **context** at each layer: `fmt.Errorf("user.GetByID id=%s: %w", id, err)`. Top of the call stack produces a debuggable chain.
+- Map errors → HTTP status in the **handler** layer via `errors.Is` / `errors.As`. Service and repository layers don't know about HTTP — they return domain or wrapped errors.
+- Sentinel errors at package boundaries (`var ErrNotFound = errors.New(...)`) — callers `errors.Is`. Custom error types when callers need fields — callers `errors.As`.
 - Don't expose raw errors to clients. The handler logs the full chain and returns a sanitized message keyed by an error code. Public errors must not leak DB internals, paths, or stack traces.
-- `panic` only for truly unrecoverable conditions at startup or programmer bugs. Production HTTP middleware **must** recover panics and turn them into 500s (logged with stack via `runtime/debug.Stack()`); without this, one bad goroutine kills the process.
+- Production HTTP middleware **must** recover panics → 500s (log with `runtime/debug.Stack()`); without this, one bad goroutine kills the process.
 
 ---
 
@@ -304,36 +316,32 @@ func TestService_GetByID(t *testing.T) {
 
 ## Build, Cross-Compile, Deploy
 
-- `go build` is enough — no Make required for build, but a `Makefile` is a fine entry point for `lint`, `test`, `tidy`, `build`, `docker`, `deploy`. CI replays Makefile targets.
-- **Reproducible builds**: `-trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}"`. `-trimpath` removes filesystem paths from the binary. Inject version/commit via `-X` flag, not `runtime` magic.
-- **CGO_ENABLED=0** for portable static binaries — required for `FROM scratch` images and AL2023 Lambda. If you need CGO (rare; e.g., native SQLite), accept the runtime dep tradeoff and base the image on `debian-slim` / `alpine`.
-- Cross-compile: `GOOS=linux GOARCH=arm64 go build` from any host (Linux/macOS/Windows). No emulation; faster than building inside a Docker on the target arch.
-- **Docker**: multi-stage. Stage 1: `golang:1.24-alpine` (or distroless go) builds. Stage 2: `gcr.io/distroless/static-debian12:nonroot` (or `scratch`) copies in the binary + `ca-certificates` + maybe `tzdata`. `USER nonroot:nonroot`. Final image < 20 MB.
-- Image scanning: Trivy / Grype in CI. Treat critical CVEs in your final image (not the build stage) as blockers. Re-scan deployed images on a schedule — new CVEs land daily.
-- Deploy artifacts: container images for ECS / EKS / EC2; zip for Lambda. Always tag with the Git SHA, never `latest` in production.
+- `go build` is enough — but a `Makefile` is a fine entry point for `lint`/`test`/`tidy`/`build`/`docker`/`deploy`. CI replays Makefile targets.
+- **Reproducible builds**: `-trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}"`. Inject version/commit via `-X`, not runtime magic.
+- **CGO_ENABLED=0** for portable static binaries — required for `FROM scratch` and AL2023 Lambda. CGO only when truly needed (native SQLite, etc.) — base image then becomes `debian-slim` / `alpine`.
+- Cross-compile: `GOOS=linux GOARCH=arm64 go build` from any host. No emulation; faster than building inside Docker on the target arch.
+- **Docker**: multi-stage. Stage 1 `golang:1.24-alpine` builds. Stage 2 `gcr.io/distroless/static-debian12:nonroot` (or `scratch`) copies binary + `ca-certificates` (+ `tzdata` if needed). `USER nonroot:nonroot`. Final image < 20 MB.
+- Image scanning (Trivy / Grype) in CI. Critical CVEs in the **final** image (not the build stage) are blockers. Re-scan deployed images on a schedule.
+- Deploy artifacts: container images for ECS / EKS / EC2; zip for Lambda. Always tag with the Git SHA — never `latest` in production.
 
 ---
 
 ## Tooling
 
-- **Required**: `gofmt` (or `goimports`), `go vet`, `golangci-lint` (curated set: `errcheck`, `govet`, `staticcheck`, `unused`, `ineffassign`, `gosec`, `gocyclo`, `gosimple`, `revive`, `misspell`, `gocritic`, `errorlint`, `nilerr`, `bodyclose`, `containedctx`, `contextcheck`, `noctx`, `sqlclosecheck`, `tparallel`, `paralleltest`). Pin the linter version in CI; `.golangci.yml` lives in repo root.
-- `govulncheck ./...` in CI on every PR. `gosec ./...` for static security analysis. `go test -race ./...` always.
-- `go mod tidy` and `go mod verify` on every CI run — fail if `go.mod`/`go.sum` would change.
-- **`pprof`** for profiling. Expose `net/http/pprof` on a separate admin listener (never the public port). Profile in production, not on a laptop. `go tool pprof -http=:9000 http://localhost:6060/debug/pprof/profile?seconds=30`.
-- **`benchstat`** for benchmark comparison: `go test -bench=. -benchmem -count=10 > old.txt`, change, `> new.txt`, `benchstat old.txt new.txt`. Don't trust single-run benchmarks.
-- IDE: `gopls` (official LSP). Set `gopls.staticcheck: true`. `delve` debugger.
-- Optional but useful: `air` / `wgo` / `reflex` for hot-reload in dev; `task` (Taskfile) as a Make alternative; `goreleaser` for multi-arch release artifacts.
+- **Required**: `gofmt`/`goimports`, `go vet`, `golangci-lint` with a curated set (`errcheck`, `staticcheck`, `unused`, `ineffassign`, `gosec`, `revive`, `errorlint`, `bodyclose`, `containedctx`, `contextcheck`, `noctx`, `sqlclosecheck`, `paralleltest`, `gocyclo`, `gocritic`, `misspell`). Pin the version in CI; `.golangci.yml` in repo root.
+- `govulncheck ./...` and `gosec ./...` in CI per PR. `go test -race ./...` always. `go mod tidy` + `go mod verify` per CI run — fail if files would change.
+- **`pprof`**: expose `net/http/pprof` on a separate admin listener (never the public port). Profile in production, not on a laptop. **`benchstat`** for benchmark comparison (`-count=10` minimum) — don't trust single runs.
+- IDE: `gopls` with `gopls.staticcheck: true`; `delve` for debugging. Optional: `air`/`wgo`/`reflex` for dev hot-reload; `task` as Make alternative; `goreleaser` for multi-arch release artifacts.
 
 ---
 
 ## Performance and Resource Tuning
 
-- Profile before optimizing. **`go test -bench=. -benchmem -cpuprofile=cpu.out -memprofile=mem.out`** at the package level; `pprof` for live processes. Don't optimize from intuition.
-- **`GOMAXPROCS`**: defaults to host CPU count, which is wrong on Kubernetes / ECS where the container has a CPU limit but the host has many cores — leads to GC contention and runaway scheduler. Use `automaxprocs` (`go.uber.org/automaxprocs`) — reads cgroup limits at startup and sets `GOMAXPROCS` correctly.
-- **`GOMEMLIMIT`** (1.19+): set to ~80% of the container memory limit. The runtime will GC harder near the limit, dramatically reducing OOMKills under spikes. Set via env in the task definition.
-- **`GOGC`**: default 100 is fine for most. Tune to 50 (more frequent GC, lower memory) or 200 (less GC, higher memory) based on profiling. `GOMEMLIMIT` makes manual `GOGC` tuning rarely necessary.
-- **Allocations dominate latency** more than CPU in most Go services. `pprof -alloc_objects` to find allocation hotspots. Pre-size slices/maps when capacity is known. `sync.Pool` for short-lived objects allocated in hot paths. `strings.Builder` over `+=` concatenation. Avoid converting `[]byte`↔`string` in tight loops.
-- HTTP: reuse `http.Client` and its `Transport` (don't allocate per request). Tune `Transport.MaxIdleConnsPerHost` upward (default 2 is too low for backend-to-backend traffic). Set `Timeout` on the client.
+- Profile before optimizing. `go test -bench=. -benchmem -cpuprofile=cpu.out -memprofile=mem.out` at package level; `pprof` for live processes. Don't optimize from intuition.
+- **`GOMAXPROCS`**: defaults to host CPU count, which is wrong on Kubernetes / ECS where the container has a CPU limit but the host has many cores — leads to GC contention and scheduler thrash. Use `automaxprocs` (`go.uber.org/automaxprocs`) — reads cgroup limits at startup and sets `GOMAXPROCS` correctly.
+- **`GOMEMLIMIT`** (1.19+): set to ~80% of the container memory limit (env in task definition). Runtime GCs harder near the limit, dramatically reducing OOMKills under spikes. With it set, manual `GOGC` tuning is rarely needed (default 100 is fine).
+- **Allocations dominate latency** more than CPU in most Go services. `pprof -alloc_objects` to find hotspots. Pre-size slices / maps when capacity known. `sync.Pool` for short-lived objects in hot paths. `strings.Builder` over `+=`. Avoid `[]byte`↔`string` conversions in tight loops.
+- HTTP: reuse `http.Client` and its `Transport` (don't allocate per request). Tune `Transport.MaxIdleConnsPerHost` upward (default 2 is too low for backend-to-backend traffic). Always set `Client.Timeout`.
 
 ---
 
@@ -350,81 +358,58 @@ func TestService_GetByID(t *testing.T) {
 
 ## When Creating a New Go Service
 
-1. `go mod init github.com/<org>/<service>`. Set `go 1.24` (or current). Create `cmd/api/main.go`, `internal/`, `Makefile`, `Dockerfile`, `.golangci.yml`, `.env.example`, `.gitignore` (covers `bin/`, `*.out`, `.env`, `tmp/`).
-2. Wire the basics: `slog` JSON logger, `automaxprocs`, `GOMEMLIMIT`, env loading, graceful shutdown, `/healthz` + `/readyz`. Use stdlib `net/http` with `ServeMux`.
-3. Pick infra: Postgres (`pgx` + `sqlc`) or DynamoDB (`aws-sdk-go-v2/service/dynamodb`). Add migrations (`golang-migrate`). Add `*pgxpool.Pool` ping in `/readyz`.
-4. Add OpenTelemetry init (`otelhttp`, `otelpgx`/`otelaws`). Point OTLP exporter at the ADOT collector sidecar.
-5. CI (GitHub Actions / GitLab / CodeBuild): `go vet`, `go test -race -coverprofile=cov.out ./...`, `golangci-lint run`, `govulncheck ./...`, `go build`, container build + push, integration tests with `testcontainers-go` (gated `//go:build integration`).
-6. Deploy: Dockerfile multi-stage → distroless/scratch; ECS Fargate task with task role + execution role (least privilege); CloudWatch logs; ALB or API Gateway; auto-scaling on CPU + ALB request count.
-7. Commit `.env.example`. Never commit `.env` or AWS credentials. Lambda variant: `bootstrap` binary, AL2023 runtime, arm64.
+1. `go mod init github.com/<org>/<service>`. Set `go 1.24`+. Create `cmd/api/main.go`, `internal/`, `Makefile`, `Dockerfile`, `.golangci.yml`, `.env.example`, `.gitignore`.
+2. Wire basics: `slog` JSON, `automaxprocs`, `GOMEMLIMIT`, env loading, graceful shutdown, `/healthz` + `/readyz`. Stdlib `net/http` `ServeMux`.
+3. Pick infra: Postgres (`pgx` + `sqlc`) or DynamoDB. Migrations via `golang-migrate`. Pool ping in `/readyz`.
+4. OTel init (`otelhttp`, `otelpgx`/`otelaws`). OTLP exporter → ADOT collector sidecar.
+5. CI: `go vet`, `go test -race -coverprofile=cov.out ./...`, `golangci-lint run`, `govulncheck ./...`, `go build`, container build + push, integration tests with `testcontainers-go` (`//go:build integration`).
+6. Deploy: multi-stage Dockerfile → distroless / scratch; ECS Fargate with distinct task + execution roles (least privilege); CloudWatch logs; ALB or API Gateway; auto-scale on CPU + ALB request count. Lambda variant: `bootstrap` binary, AL2023, arm64. GPU variant: ECS-on-EC2 / EKS, amd64, distroless Go service in front of NIM/Triton container.
+7. Commit `.env.example`. Never commit `.env` or AWS creds.
 
 ---
 
 ## When Working on an Existing Project
 
-1. Read the relevant files first — `cmd/` entry, `internal/<domain>/`, store impl, related handler, `Makefile`, `Dockerfile`, `.golangci.yml`.
-2. Match existing conventions even if they differ from these rules — consistency beats theoretical best practices. If they use `gin` or `chi`, use it; don't migrate without approval.
-3. Don't refactor unrelated code; don't add types/comments to code you didn't change; don't introduce new libs without explicit user approval. Match existing naming, file organization, error wrapping style.
-4. Trace data flow: handler → service → store. Don't skip layers (handler reaching into store) unless that's the existing pattern.
-5. Audit context: every function on the path takes `ctx` and passes it down. Audit cancellation: long-running goroutines listen on `ctx.Done()`.
-6. Audit observability: new endpoint → spans + metrics + structured logs with the request ID. New downstream call → traced via `otelhttp` / `otelaws` / `otelpgx`.
-7. Run `go vet`, `golangci-lint run`, `go test -race ./...`, `go mod tidy` before committing.
+1. Read first — `cmd/` entry, `internal/<domain>/`, store impl, related handler, `Makefile`, `Dockerfile`, `.golangci.yml`.
+2. Match existing conventions even if they differ from these rules — consistency beats theoretical best practice. If they use `gin` or `chi`, use it; don't migrate without approval.
+3. Don't refactor unrelated code; don't add types / comments to code you didn't change; don't introduce new libs without approval. Match existing naming, organization, error-wrapping style.
+4. Trace data flow handler → service → store; don't skip layers unless that's the existing pattern. Audit `ctx` propagation on every function in the path; long-running goroutines listen on `ctx.Done()`.
+5. Audit observability: new endpoints get spans + metrics + structured logs with request ID; new downstream calls go through `otelhttp` / `otelaws` / `otelpgx`.
+6. Run `go vet`, `golangci-lint run`, `go test -race ./...`, `go mod tidy` before committing.
 
 ---
 
 ## Pre-Completion Checklist
 
-- [ ] `gofmt`, `go vet`, `golangci-lint`, `go test -race`, `go mod tidy`, `govulncheck` all pass (or document why a step wasn't run)
-- [ ] Every exported identifier has a doc comment starting with the identifier name
-- [ ] Every blocking/I/O function takes `ctx context.Context` as first parameter; no `context.Background()` in handlers/library code
-- [ ] All errors wrapped with `%w` and context; `errors.Is` / `errors.As` used (not string compare); no swallowed errors
+- [ ] `gofmt`, `go vet`, `golangci-lint`, `go test -race`, `go mod tidy`, `govulncheck` all pass (or document why)
+- [ ] Every exported identifier has a doc comment starting with its name
+- [ ] Every blocking / I/O function takes `ctx context.Context` first; no `context.Background()` in handlers / library code
+- [ ] Errors wrapped with `%w` + context; `errors.Is` / `errors.As` (not string compare); none swallowed
 - [ ] No `panic` outside `main` startup or recovery middleware; `log.Fatal` only in `main`
 - [ ] No SQL built with `fmt.Sprintf` from user input; all queries parameterized; bodies size-capped via `MaxBytesReader`; all input validated
-- [ ] No secrets in code, env defaults, logs, or commits; `crypto/rand` (not `math/rand`) for tokens; httpOnly Secure cookies for sessions
-- [ ] HTTP server has `ReadHeaderTimeout`/`ReadTimeout`/`WriteTimeout`/`IdleTimeout`; graceful shutdown on SIGTERM
-- [ ] Goroutines have an obvious termination path; concurrent map writes guarded; `errgroup` used for parallel fail-fast
-- [ ] Logs are structured JSON (`slog`); request ID + trace ID propagated; no PII / tokens / Authorization headers logged
-- [ ] OTel spans cover new business operations and downstream calls; HTTP / DB / AWS clients auto-instrumented
-- [ ] DTOs returned to clients (no raw domain or DB types); error responses have stable shape; no internal errors leaked
-- [ ] AWS SDK v2 clients are singletons; `ctx` passed; paginators used; no v1 code introduced
-- [ ] Dockerfile multi-stage with distroless/scratch; `CGO_ENABLED=0`; `arm64` unless a CGO dep blocks; image scanned
-- [ ] Tests added: table-driven with `t.Parallel()`; integration tests gated by tag; `t.Run` for subtests; race detector clean
-- [ ] No CI/CD files modified without approval; no `go get -u ./...` of unrelated deps; new deps justified
+- [ ] No secrets in code, env defaults, logs, or commits; `crypto/rand` for tokens; httpOnly Secure cookies for sessions
+- [ ] HTTP server has all four timeouts set; graceful shutdown on SIGTERM
+- [ ] Goroutines have obvious termination paths; concurrent map writes guarded; `errgroup` used for parallel fail-fast
+- [ ] Logs are structured JSON (`slog`); request + trace IDs propagated; no PII / tokens / `Authorization` headers logged
+- [ ] OTel spans cover new business ops + downstream calls; HTTP / DB / AWS auto-instrumented
+- [ ] DTOs returned to clients (no raw domain / DB types); error responses have stable shape
+- [ ] AWS SDK v2 only; clients are singletons; `ctx` passed; paginators used
+- [ ] Dockerfile multi-stage / distroless; `CGO_ENABLED=0`; arch chosen explicitly (arm64 default; amd64 if CGO / GPU / AVX-512 / customer); image scanned
+- [ ] GPU work goes through gRPC to Triton/NIM; CUDA not called from Go via CGO; DCGM metrics scraped
+- [ ] Tests added: table-driven, `t.Parallel()`, `t.Run` subtests; integration tests tag-gated; race-clean
+- [ ] No CI/CD changes without approval; no `go get -u ./...` of unrelated deps; new deps justified
 
 ---
 
 ## Project-Specific Overrides
 
 <!--
-Customize this section for your project. Example overrides:
-
-### HTTP Layer
-- Stdlib net/http (Go 1.22+ ServeMux); chi only for v1 endpoints under /v1/*
-- Middleware order: recover -> request_id -> otelhttp -> slog -> auth -> ratelimit
-- DTOs in internal/<domain>/dto.go; never return domain or store rows directly
-
-### Database
-- Postgres via pgx/v5 + sqlc; queries in db/queries/*.sql, generated to internal/db/
-- Migrations in migrations/ (golang-migrate); applied by cmd/migrate before deploy
-- Pool sizing: MaxConns=20, MaxConnLifetime=30m, idle=5m
-
-### AWS
-- ECS Fargate ARM64; task role per service (least privilege); secrets in Secrets Manager
-- ADOT sidecar exports to X-Ray + CloudWatch + Prometheus workspace
-- Lambda functions: provided.al2023, arm64, bootstrap binary, lambda layer for ADOT
-
-### Logging / Observability
-- slog JSONHandler; level from LOG_LEVEL env (default info); request_id and trace_id always
-- OpenTelemetry SDK; OTLP gRPC to localhost:4317; sample 5% in prod, 100% in staging
-- RED metrics on every HTTP route; queue depth + processing latency on every worker
-
-### Testing
-- testify/require; table-driven; t.Parallel everywhere safe
-- Integration tests build tag //go:build integration — testcontainers Postgres + LocalStack
-- Coverage gate: 70% on internal/<domain>/; no gate on cmd/
-
-### Tooling / CI
-- golangci-lint v1.60+; .golangci.yml in repo root with curated set
-- Makefile entry points: lint, test, integration, build, docker, deploy
-- One Dependabot PR per major bump; security PRs auto-merged after CI green
+Customize for your project. Examples:
+- HTTP: stdlib net/http (1.22+ ServeMux); chi only for v1 endpoints; middleware order recover -> request_id -> otelhttp -> slog -> auth -> ratelimit; DTOs in internal/<domain>/dto.go
+- Database: Postgres via pgx/v5 + sqlc; queries in db/queries/*.sql -> internal/db/; migrations golang-migrate before deploy; pool MaxConns=20, MaxConnLifetime=30m
+- AWS: ECS Fargate ARM64; task role per service (least privilege); secrets in Secrets Manager; ADOT sidecar -> X-Ray + CloudWatch + Prometheus; Lambda provided.al2023 + arm64 + bootstrap, ADOT layer
+- GPU: amd64; Triton or NIM gRPC behind a Go API; distroless Go in front, nvcr.io CUDA only on inference container; DCGM via dcgm-exporter scraped to OTel; batch 5-50ms in Go before forwarding
+- Logs / O11y: slog JSONHandler, level from LOG_LEVEL (default info); request_id + trace_id always; OpenTelemetry SDK, OTLP gRPC localhost:4317; sample 5% prod, 100% staging
+- Testing: testify/require; table-driven, t.Parallel; integration tests //go:build integration with testcontainers Postgres + LocalStack; coverage gate 70% on internal/<domain>/
+- Tooling / CI: golangci-lint v1.60+; .golangci.yml in repo root; Make targets lint/test/integration/build/docker/deploy; one Dependabot PR per major bump
 -->

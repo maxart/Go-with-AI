@@ -1,6 +1,6 @@
 # Go-with-AI
 
-A `CLAUDE.md` template that teaches [Claude Code](https://docs.anthropic.com/en/docs/claude-code) modern Go backend best practices for services running on AWS. Drop it into any Go HTTP / gRPC API or worker project and Claude will follow production-grade conventions for project layout, the stdlib `net/http` server, `context` propagation, `pgx` + `sqlc` database access, AWS SDK v2, AWS Lambda (`provided.al2023` + arm64), ECS Fargate, OpenTelemetry, `slog`, security, and testing — automatically, on every interaction.
+A `CLAUDE.md` template that teaches [Claude Code](https://docs.anthropic.com/en/docs/claude-code) modern Go backend best practices for services running on AWS or NVIDIA GPU hosts. Drop it into any Go HTTP / gRPC API, worker, or model-serving gateway and Claude will follow production-grade conventions for project layout, the stdlib `net/http` server, `context` propagation, `pgx` + `sqlc` database access, AWS SDK v2, AWS Lambda (`provided.al2023` + arm64), ECS Fargate, **NVIDIA GPU workloads (Triton / NIM / NVCF / DGX Cloud)**, **arm64 vs amd64 architecture choice**, OpenTelemetry, `slog`, security, and testing — automatically, on every interaction.
 
 ## Why
 
@@ -12,10 +12,10 @@ Pick the one that fits your project.
 
 | File | Size | Contains | Best for |
 |---|---|---|---|
-| [`CLAUDE.md.FULL`](./CLAUDE.md.FULL) | 39,819 chars | All rules **plus canonical code examples** (HTTP handler, sqlc store, table-driven test, project tree) | Teams that want rules plus concrete patterns — Claude follows rules-with-examples more reliably |
-| [`CLAUDE.md.SHORT`](./CLAUDE.md.SHORT) | 33,550 chars | All rules, **no fenced code blocks** | Token-constrained setups, or projects that just need guardrails without inline samples |
+| [`CLAUDE.md.FULL`](./CLAUDE.md.FULL) | 39,951 chars | All rules **plus canonical code examples** (HTTP handler, sqlc store, table-driven test, project tree) | Teams that want rules plus concrete patterns — Claude follows rules-with-examples more reliably |
+| [`CLAUDE.md.SHORT`](./CLAUDE.md.SHORT) | 37,423 chars | All rules, **no fenced code blocks** | Token-constrained setups, or projects that just need guardrails without inline samples |
 
-Both files cover the **same rules** — the only difference is whether each rule is illustrated with a code block. SHORT is ~16% smaller because it strips all fenced code blocks while preserving every rule, table, and checklist.
+Both files cover the **same rules** — the only difference is whether each rule is illustrated with a code block. SHORT is ~6% smaller because it strips all fenced code blocks while preserving every rule, table, and checklist.
 
 <details>
 <summary><strong>What's inside (click to expand)</strong></summary>
@@ -34,7 +34,9 @@ Both files cover the **same rules** — the only difference is whether each rule
 | **Database** | `pgx/v5` + `sqlc`; one `*pgxpool.Pool` per process; tuned `MaxConns` / `MaxConnLifetime`; transactions short; placeholders only (no `fmt.Sprintf`); store interface in domain package |
 | **AWS SDK** | v2 only (v1 EOL July 2025); singletons; `ctx` always; IAM roles (never keys); paginators; per-service clients via functional options |
 | **Lambda** | `provided.al2023` runtime (`go1.x` deprecated); arm64 Graviton2 (20% cheaper); `bootstrap` binary; package-level init; cold start <60ms achievable |
-| **ECS / Fargate** | Multi-stage Dockerfile → distroless/scratch arm64; `/healthz` (liveness) vs `/readyz` (readiness); distinct task vs execution roles; secrets via task definition; Fargate Spot for tolerant workloads |
+| **ECS / Fargate** | Multi-stage Dockerfile → distroless/scratch arm64; `/healthz` (liveness) vs `/readyz` (readiness); distinct task vs execution roles; secrets via task definition; Fargate Spot for tolerant workloads (no GPU on Fargate) |
+| **CPU architecture** | arm64 default (Graviton, ~20% cheaper); amd64 when CGO deps lack arm64 wheels, GPU/CUDA, AVX-512/AMX, or x86-only customer; `docker buildx` for multi-arch when consumers need both |
+| **GPU / NVIDIA** | Go is the service layer (routing, auth, batching, observability) — Python/C++ does GPU math; talk to Triton / TGI / vLLM / NIM over gRPC (generate Go client from `.proto`); host on **NVCF** (serverless GPU), **DGX Cloud** (managed), or **EC2 G5/G6/P4/P5 + ECS-on-EC2 / EKS + GPU Operator**; CUDA via CGO is almost always wrong; DCGM via `dcgm-exporter` for telemetry |
 | **Configuration** | Env vars at startup, validate fail-fast; one source of truth in `internal/config`; secrets in Secrets Manager / SSM; never log config |
 | **Logging** | `log/slog` JSON in prod; pass logger (don't use global); `*Context` variants; key-value pairs not formatted strings; `LogValuer` for redaction |
 | **Observability** | OpenTelemetry + ADOT (X-Ray transitioning to OTel); auto-instrument HTTP / DB / AWS via `otelhttp` / `otelpgx` / `otelaws`; manual spans for business ops; baseline RED metrics |
@@ -157,7 +159,8 @@ Rules with code examples (FULL version) are followed more reliably than abstract
 - **AWS SDK for Go**: **v2 only** (`github.com/aws/aws-sdk-go-v2/...`). v1 reached end-of-support **July 31, 2025** — migrate any v1 code; do not start anything new on it.
 - **AWS Lambda runtime**: `provided.al2023` (the `go1.x` runtime was deprecated December 31, 2023 and rejects new deployments).
 - **Database**: rules tuned for Postgres + `pgx/v5` + `sqlc`. Most apply to MySQL via `database/sql` + a similar generator; DynamoDB section adapts; `lib/pq` is in maintenance mode and not recommended.
-- **Deployment**: Vercel-equivalent for Go is largely Cloud Run / Fly.io / Render — most rules apply (single static binary, env config, graceful shutdown). The AWS sections (Lambda, ECS Fargate, IAM roles, ADOT) are AWS-specific.
+- **Deployment**: AWS-first (Lambda, ECS Fargate, EKS, EC2). Cloud Run / Fly.io / Render apply equally for the language sections; the Lambda / ECS / IAM / ADOT specifics are AWS-only. **GPU hosting** covers AWS EC2 G/P-family + ECS-on-EC2 / EKS, **NVIDIA Cloud Functions (NVCF)**, **NVIDIA DGX Cloud**, plus a note on CoreWeave / Lambda Labs / RunPod for raw GPU.
+- **CPU architecture**: rules default to **arm64** (Graviton on AWS) and call out when **amd64** is the right call (CGO deps, CUDA / GPU workloads, AVX-512, customer constraints). Multi-arch via `docker buildx` is documented.
 - **HTTP framework**: rules default to stdlib `net/http` (1.22+ `ServeMux`). `chi`, `echo`, `gin` are noted as acceptable; `fiber` is flagged as non-stdlib (built on `fasthttp`). Adapt naming and middleware patterns to your choice.
 
 Not for `pages/`-style web frameworks, gRPC-only services without REST, or non-AWS clouds. Most language-level rules (errors, context, concurrency, testing, security, tooling) apply universally; the deployment, Lambda, ECS, and ADOT sections are AWS-specific. If you're on GCP / Azure / on-prem, keep the language sections and replace the deployment/observability sections with your platform's equivalents.
@@ -210,7 +213,10 @@ The template defaults to Postgres + `pgx/v5` + `sqlc`. The rules generalize: que
 For most of Go's history, the stdlib router was too primitive. Go 1.22 (Feb 2024) added method matching, path wildcards, and exact-path patterns to `ServeMux` — for most services this is enough. Reach for `chi` if you want a richer middleware ecosystem; `echo` / `gin` only if your team is already invested or you use the integrated bindings / validators. The template doesn't ban them — but it defaults to stdlib because fewer dependencies = less audit surface, fewer breaking changes, more new-team-member familiarity.
 
 **Why arm64 / Graviton2?**
-About 20% cheaper duration on Lambda and Fargate, ~19% faster for typical Go workloads. Cross-compiling Go for arm64 is trivial (`GOARCH=arm64`); no Docker emulation needed. Only fall back to x86_64 if a CGO dependency lacks arm64 wheels.
+About 20% cheaper duration on Lambda and Fargate, ~19% faster for typical Go workloads. Cross-compiling Go for arm64 is trivial (`GOARCH=arm64`); no Docker emulation needed. Fall back to **amd64** when a CGO dependency lacks arm64 wheels, the workload uses CUDA / NVIDIA GPUs (drivers + ecosystem are amd64-first), a hot path needs AVX-512 / AMX, or a customer / on-prem environment is x86-only. The guide includes a decision matrix.
+
+**What about NVIDIA GPUs / Cloud?**
+Go isn't the language you write CUDA in — it's the language for the **service layer in front of GPU workloads**: API gateway, request batching, auth, observability, Kubernetes operators (NVIDIA's own GPU Operator is Go). The pattern: Python or C++ does the GPU math in Triton / TGI / vLLM / NIM; Go fronts it over gRPC. Hosting options: **NVCF** (NVIDIA Cloud Functions — serverless GPU, pay per invocation), **DGX Cloud** (managed multi-tenant GPU clusters via hyperscaler partners), or **AWS EC2 G5/G6/P4/P5 + ECS-on-EC2 or EKS + the GPU Operator** for self-managed. Fargate has no GPUs. Calling CUDA from Go via CGO is almost always wrong (build complexity, debugging loss, ecosystem velocity); talk to a separate Python/C++ inference process over gRPC instead. The guide has a full section on GPU patterns, hosting options, NVIDIA Container Toolkit, DCGM observability, and a hosting decision matrix.
 
 **Why OpenTelemetry instead of the AWS X-Ray SDK?**
 AWS X-Ray transitioned to ingest OTLP, and AWS Distro for OpenTelemetry (ADOT) is now the AWS-blessed collector. The X-Ray SDK is on a deprecation trajectory. New code should use OTel directly with `otelhttp` / `otelpgx` / `otelaws` for auto-instrumentation; ADOT forwards to X-Ray, CloudWatch Metrics, Prometheus Workspace, and any other OTLP-compatible backend (Datadog, Honeycomb, New Relic, Grafana, Splunk).
@@ -232,6 +238,12 @@ AWS X-Ray transitioned to ingest OTLP, and AWS Distro for OpenTelemetry (ADOT) i
 - [`golangci-lint`](https://golangci-lint.run/) — meta-linter
 - [`testcontainers-go`](https://golang.testcontainers.org/) — integration tests with real Docker dependencies
 - [Distroless images](https://github.com/GoogleContainerTools/distroless) — minimal base images for Go
+- [NVIDIA Triton Inference Server](https://github.com/triton-inference-server/server) — open-source inference server, gRPC + HTTP
+- [NVIDIA NIM Microservices](https://www.nvidia.com/en-us/ai-data-science/products/nim-microservices/) — packaged inference containers
+- [NVIDIA Cloud Functions (NVCF)](https://developer.nvidia.com/dgx-cloud/nvcf) — serverless GPU inference
+- [NVIDIA DGX Cloud](https://www.nvidia.com/en-us/data-center/dgx-cloud/) — managed multi-tenant GPU clusters
+- [NVIDIA GPU Operator](https://github.com/NVIDIA/gpu-operator) — Kubernetes operator (in Go) for GPU lifecycle
+- [`dcgm-exporter`](https://github.com/NVIDIA/dcgm-exporter) — GPU telemetry as Prometheus metrics
 - [React-with-AI](https://github.com/maxart/React-with-AI) and [Nextjs-with-AI](https://github.com/maxart/Nextjs-with-AI) — companion templates for the frontend side of the stack
 
 ## License

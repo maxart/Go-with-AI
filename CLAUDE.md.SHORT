@@ -4,7 +4,7 @@ _Origin: https://github.com/maxart/Go-with-AI — check upstream for newer versi
 
 ## Identity
 
-Production Go backend service (HTTP/gRPC API or worker) on AWS (Lambda, ECS Fargate, EKS, or EC2). Modern best practices (2025-2026, Go 1.24+). Clean, idiomatic, type-safe, secure code that scales horizontally. Prioritize correctness, clarity, observability, operational simplicity. Don't over-engineer. Go rewards small, sharp, boring code.
+Production Go backend service (HTTP/gRPC API or worker) on AWS (Lambda, ECS Fargate, EKS, or EC2) — or on an NVIDIA-GPU host (EC2 G/P-family, EKS with the GPU Operator, NVIDIA DGX Cloud, NVIDIA Cloud Functions). Modern best practices (2025-2026, Go 1.24+). Clean, idiomatic, type-safe, secure code that scales horizontally. Prioritize correctness, clarity, observability, operational simplicity. Don't over-engineer. Go rewards small, sharp, boring code.
 
 ---
 
@@ -133,13 +133,36 @@ Avoid `util`/`common`/`helpers`/`models` — they become dumping grounds. Name p
 
 ## AWS ECS / Fargate
 
-- One process per container. **Multi-stage Dockerfile**: stage 1 compiles; stage 2 `FROM scratch` (or `gcr.io/distroless/static-debian12:nonroot`) with the binary + `ca-certificates`. Image < 20 MB. Build with `CGO_ENABLED=0 GOOS=linux GOARCH=arm64` and run on Graviton (`runtimePlatform: { cpuArchitecture: ARM64 }`).
+- One process per container. **Multi-stage Dockerfile**: stage 1 compiles; stage 2 `FROM scratch` (or `gcr.io/distroless/static-debian12:nonroot`) with the binary + `ca-certificates`. Image < 20 MB. Build with `CGO_ENABLED=0 GOOS=linux GOARCH=arm64` and run on Graviton (`runtimePlatform: { cpuArchitecture: ARM64 }`). **Fargate has no GPUs** — for GPU workloads use ECS-on-EC2 or EKS with the GPU Operator (see GPU section).
 - Listen on `PORT` env (default 8080), bind `0.0.0.0`. **Graceful shutdown**: ECS sends `SIGTERM` then waits `stopTimeout` (set 30-60s) before `SIGKILL`. Trap, stop accepting, drain in-flight, close DB pools, return.
 - Health checks: `/healthz` 200 with no DB hit (liveness — only fails if hung). `/readyz` checks DB ping + critical deps (fails when overloaded). Map ALB target group to `/readyz`.
 - **IAM Task Role** (app's AWS calls) vs **Execution Role** (ECS pulling image, writing logs, fetching secrets) — distinct, least privilege. Don't reuse.
 - Config via env vars sourced from Secrets Manager / Parameter Store via the task definition. Don't bake secrets in the image. Don't fetch per request — read once at startup.
 - Logs: JSON to stdout; `awslogs` driver ships to CloudWatch. High-volume: FireLens + Fluent Bit → S3/OpenSearch/Kinesis.
 - **Fargate Spot** for interruption-tolerant workloads (batch, async workers); on-demand for user-facing. Always tolerate sudden termination. Autoscale on the right signal: CPU/mem for compute-bound; SQS depth for workers; ALB request count or target response time for HTTP. Min capacity ≥ 2 across AZs.
+
+---
+
+## CPU Architecture (arm64 vs amd64)
+
+- **Default `arm64`** (Graviton2/3 on AWS) for pure-Go services — ~20% cheaper, ~19% faster. Cross-compile from any host: `GOOS=linux GOARCH=arm64 CGO_ENABLED=0`. No emulation needed.
+- **Choose `amd64`** when **any** of: a CGO dep lacks arm64 wheels; the workload uses CUDA / NVIDIA GPUs (drivers + ecosystem are amd64-first); a hot path needs AVX-512 / AMX; customer / on-prem constraint is x86-only.
+- **Multi-arch images** (`docker buildx --platform linux/amd64,linux/arm64`) only when consumers genuinely need both. Otherwise single-arch is simpler and faster to build. CGO multi-arch under buildx uses QEMU (slow); prefer native runners per arch in CI.
+- Pin the arch in the task / Dockerfile / build script — implicit choices break when the host changes (Apple Silicon dev → x86 CI → Graviton prod is a common bug surface).
+
+---
+
+## GPU and NVIDIA Workloads
+
+Go is the **service layer**, not the inference engine. Python (or C++) does the GPU math; Go handles routing, validation, auth, batching, observability, and quota in front of it. Don't call CUDA from Go.
+
+- **Talk to inference servers over gRPC.** NVIDIA Triton, TGI, vLLM, NIM, and most serving stacks expose gRPC — generate a Go client from the `.proto` (`protoc --go_out --go-grpc_out`). For HTTP-only servers (Ollama, OpenAI-compatible), wrap `*http.Client` with `otelhttp.NewTransport`. **NIM** (NVIDIA Inference Microservices) is packaged-model containers with an OpenAI-compatible REST API — treat as any HTTP API, generous timeouts, stream where supported.
+- **Hosting**: **NVCF** (NVIDIA Cloud Functions) for serverless GPU inference (pay per invocation, good for bursty); **DGX Cloud** for managed multi-tenant GPU clusters via hyperscaler partners; **EC2 G5/G6/P4/P5 + ECS-on-EC2 or EKS** for self-managed; **CoreWeave / Lambda Labs / RunPod** often cheapest raw GPU. **Fargate has no GPUs.** **EKS + NVIDIA GPU Operator** (itself in Go) is the standard Kubernetes pattern: pods request `nvidia.com/gpu: 1`, operator handles drivers / toolkit / MIG / monitoring.
+- **Container images**: Go services that only **call** GPU servers stay on **distroless** — no GPU base image needed. Only the inference container needs `nvcr.io/nvidia/cuda:*-base-ubuntu*` and the `--gpus` / `nvidia.com/gpu` resource.
+- **Architecture**: GPU hosts are predominantly **amd64** in AWS / Azure / GCP. CUDA-on-arm64 is mature on Jetson and Grace Hopper but lags broadly. Default `GOARCH=amd64` for binaries that run on GPU hosts or link CUDA libs.
+- **CUDA via CGO is almost always wrong** — build complexity, race detector / pprof / delve degrade, Python ships CUDA features quarters faster, you lose the single static binary. Talk to a separate Python/C++ inference process over gRPC instead.
+- **Observability**: scrape **DCGM** via `dcgm-exporter` (Prometheus format) — utilization, framebuffer, SM activity, power, temperature. Sidecar (ECS) or DaemonSet (EKS). Correlate with Go-side OTel traces by tagging spans with model name + version. Track cost-per-inference (request count × hourly GPU cost / GPU count).
+- **Don't** auto-scale GPU instances aggressively — they cost 10-100x CPU per hour. Set min ≥ 1, max conservative, scale on queue depth or p95 latency, long cooldowns. Prefer **batching at the Go layer** (5-50 ms accumulation → single batched gRPC call) before adding GPU capacity.
 
 ---
 
@@ -305,7 +328,8 @@ Avoid `util`/`common`/`helpers`/`models` — they become dumping grounds. Name p
 - [ ] OTel spans cover new business operations and downstream calls; HTTP / DB / AWS clients auto-instrumented
 - [ ] DTOs returned to clients (no raw domain or DB types); error responses have stable shape; no internal errors leaked
 - [ ] AWS SDK v2 clients are singletons; `ctx` passed; paginators used; no v1 code introduced
-- [ ] Dockerfile multi-stage with distroless/scratch; `CGO_ENABLED=0`; `arm64` unless a CGO dep blocks; image scanned
+- [ ] Dockerfile multi-stage with distroless/scratch; `CGO_ENABLED=0`; arch chosen explicitly (arm64 default; amd64 if CGO / GPU / AVX-512 / customer); image scanned
+- [ ] GPU work goes through gRPC to Triton/NIM; CUDA not called from Go via CGO; DCGM metrics scraped
 - [ ] Tests added: table-driven with `t.Parallel()`; integration tests gated by tag; `t.Run` for subtests; race detector clean
 - [ ] No CI/CD files modified without approval; no `go get -u ./...` of unrelated deps; new deps justified
 
@@ -315,10 +339,11 @@ Avoid `util`/`common`/`helpers`/`models` — they become dumping grounds. Name p
 
 <!--
 Customize for your project. Examples:
-- HTTP: stdlib net/http (Go 1.22+ ServeMux); chi only for /v1/* legacy; middleware order recover -> request_id -> otelhttp -> slog -> auth -> ratelimit; DTOs in internal/<domain>/dto.go
-- Database: Postgres via pgx/v5 + sqlc; queries in db/queries/*.sql, generated to internal/db/; migrations via golang-migrate before deploy; pool MaxConns=20, MaxConnLifetime=30m
-- AWS: ECS Fargate ARM64; task role per service (least privilege); Secrets Manager for secrets; ADOT sidecar exports to X-Ray + CloudWatch + Prometheus; Lambda funcs use provided.al2023 + arm64 + bootstrap
-- Logging / Observability: slog JSONHandler; level from LOG_LEVEL env (default info); request_id and trace_id always; OpenTelemetry SDK; OTLP gRPC to localhost:4317; sample 5% prod, 100% staging
-- Testing: testify/require; table-driven; t.Parallel everywhere safe; integration tests build tag //go:build integration with testcontainers Postgres + LocalStack; coverage gate 70% on internal/<domain>/
-- Tooling / CI: golangci-lint v1.60+; .golangci.yml in repo root; Makefile targets lint/test/integration/build/docker/deploy; one Dependabot PR per major bump; security PRs auto-merged after CI green
+- HTTP: stdlib net/http (1.22+ ServeMux); chi only for v1 endpoints; middleware order recover -> request_id -> otelhttp -> slog -> auth -> ratelimit; DTOs in internal/<domain>/dto.go
+- Database: Postgres via pgx/v5 + sqlc; queries in db/queries/*.sql -> internal/db/; migrations golang-migrate before deploy; pool MaxConns=20, MaxConnLifetime=30m
+- AWS: ECS Fargate ARM64; task role per service (least privilege); secrets in Secrets Manager; ADOT sidecar -> X-Ray + CloudWatch + Prometheus; Lambda provided.al2023 + arm64 + bootstrap, ADOT layer
+- GPU: amd64; Triton or NIM gRPC behind a Go API; distroless Go in front, nvcr.io CUDA only on inference container; DCGM via dcgm-exporter scraped to OTel; batch 5-50ms in Go before forwarding
+- Logs / O11y: slog JSONHandler, level from LOG_LEVEL (default info); request_id + trace_id always; OpenTelemetry SDK, OTLP gRPC localhost:4317; sample 5% prod, 100% staging
+- Testing: testify/require; table-driven, t.Parallel; integration tests //go:build integration with testcontainers Postgres + LocalStack; coverage gate 70% on internal/<domain>/
+- Tooling / CI: golangci-lint v1.60+; .golangci.yml in repo root; Make targets lint/test/integration/build/docker/deploy; one Dependabot PR per major bump
 -->

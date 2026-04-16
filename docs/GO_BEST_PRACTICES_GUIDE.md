@@ -1949,6 +1949,237 @@ Match `CLAUDE.md`'s checklist; expanded reasoning here:
 
 ---
 
+## 24. CPU Architecture: arm64 vs amd64
+
+The earlier sections default to `arm64` (Graviton2/3) for AWS Lambda and ECS Fargate because, for general-purpose Go workloads, it's about **20% cheaper for duration / vCPU-hour** at **~19% better performance** than x86_64. Most pure-Go services see no downside. Before choosing, walk through this decision:
+
+### 24.1 When arm64 is the right default
+
+- Pure-Go service (no CGO).
+- Standard HTTP / gRPC / worker workload.
+- Postgres / DynamoDB / Redis / SQS / Kafka — none of which care about your CPU arch.
+- Deploying on AWS Lambda (`provided.al2023`), ECS Fargate (Graviton-backed), EKS (Graviton node groups), or any other arm64-capable host.
+
+This covers the vast majority of new backend services. Default to arm64 unless one of the next subsections applies.
+
+### 24.2 When you need amd64 (x86_64)
+
+Pick amd64 when **any** of these is true:
+
+- **CGO dependency without arm64 support.** Some C libraries — older proprietary SDKs, certain database drivers, native ML/CUDA libraries — only ship x86_64 binaries. Attempting to cross-compile against an amd64-only library fails at link time.
+- **CUDA / GPU workloads.** Most NVIDIA data-center GPUs in cloud environments (A10, L4, L40S, A100, H100, B200 in AWS `g5`/`g6`/`p4`/`p5`/`p6` instances; Azure `NC`/`ND` series; GCP `A2`/`A3`) are paired with amd64 hosts. NVIDIA's CUDA driver and runtime are first-class on `linux/amd64`; arm64 is supported on Jetson / Grace Hopper but support across CUDA-adjacent libraries (TensorRT, cuDNN versions, third-party CUDA wrappers) lags. If your service is GPU-adjacent, default to amd64.
+- **Specific x86 instructions.** AVX-512, AMX, or other Intel/AMD-only ISA features used by a hot path or a hand-tuned dependency. Rare in pure Go (the compiler doesn't emit AVX-512 broadly), but real for some crypto / compression / vector libraries that ship hand-tuned amd64 paths.
+- **Customer / compliance constraints.** A customer's on-prem environment is x86-only; a regulated environment has only-x86-validated AMIs; a vendor product you wrap requires x86.
+- **Cost equivalence at scale.** For some niche workloads (heavy SIMD, certain in-memory databases) amd64's per-vCPU performance can offset its higher hourly price. Benchmark before assuming.
+
+### 24.3 Cross-compiling to amd64
+
+Same shape as arm64, just swap `GOARCH`:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+  -o bin/api ./cmd/api
+```
+
+No emulation needed if the host is itself x86 (or if the host is ARM and `CGO_ENABLED=0` — pure Go cross-compiles trivially in either direction).
+
+With CGO enabled (`CGO_ENABLED=1`), you need the cross-compilation toolchain for the target. The cleanest path is **Docker buildx with multi-platform builds**:
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --tag ${REGISTRY}/api:${SHA} \
+  --push .
+```
+
+`buildx` uses QEMU emulation under the hood when building for a non-native arch; it's slow (often 5-10x slower than native) but it works without managing per-arch toolchains. For CI/CD, prefer running the build on a native runner per arch (GitHub Actions `runs-on: ubuntu-24.04-arm` or self-hosted Graviton runners) and then `docker manifest create` to combine.
+
+### 24.4 Multi-arch container images
+
+If you publish images that may run on either arch (open-source projects, internal libraries), build a multi-arch manifest. Consumers pull whichever arch matches their host:
+
+```bash
+docker buildx create --name builder --use
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --tag ghcr.io/myorg/api:1.4.2 \
+  --push .
+```
+
+For internal services running on a known arch, single-arch images are simpler and faster to build. Publish multi-arch only when consumers genuinely need it.
+
+### 24.5 Decision matrix at a glance
+
+| Constraint | Recommended arch |
+|---|---|
+| Pure Go, AWS Lambda or Fargate | **arm64** (cheaper + faster) |
+| Pure Go, EKS with mixed nodes | **arm64** preferred; multi-arch image if migrating gradually |
+| CGO dep with arm64 support | **arm64** still |
+| CGO dep without arm64 support | **amd64** |
+| CUDA / GPU workload | **amd64** (drivers + ecosystem maturity) |
+| AVX-512 / AMX hot path | **amd64** |
+| Customer / on-prem x86-only | **amd64** |
+| Open-source library / image consumed by both | **multi-arch** |
+
+---
+
+## 25. GPU and NVIDIA Workloads
+
+Go is not the language you write CUDA kernels in. It's not the language you train PyTorch models in. But it's an excellent language for the **service layer that fronts GPU workloads**: API gateway in front of an inference server, orchestration of GPU jobs, metrics/observability sidecar, Kubernetes operators (NVIDIA's own GPU Operator is written in Go), CLI tooling, autoscaling controllers.
+
+The pattern: **Python (or C++) does the GPU math; Go does the request handling, validation, auth, observability, and routing.** Splitting along that line lets each language do what it's good at.
+
+### 25.1 What Go does well in a GPU stack
+
+- **HTTP / gRPC API in front of an inference server.** Triton, TGI, vLLM, Ollama, NIM all expose HTTP / gRPC. Go fronts them with the same patterns this guide covers — validation, auth, rate limit, structured logging, OTel traces — and forwards inference calls to the model server.
+- **Request routing and batching.** Aggregating low-latency single-request traffic into larger batches that GPUs prefer. Mature pattern: a Go service accumulates requests for ~5-50 ms, fires a batched gRPC call, fans the response back out.
+- **Tenant isolation, queueing, prioritization.** The Go service knows about your customers, quotas, billing tiers; the model server doesn't.
+- **GPU job orchestration.** Submit training / fine-tuning / batch jobs to Kubernetes (with `nvidia.com/gpu` resource requests), poll status, surface metrics to the user. The Kubernetes Go client (`client-go`) is the standard.
+- **Observability collection.** Pull GPU metrics (utilization, memory, SM activity, power, temperature) from NVIDIA DCGM or `dcgm-exporter`; publish to Prometheus / OTel / CloudWatch.
+- **CLI / dev tooling around model lifecycle.** Pull/push to model registries, validate model configs, drive deployments. Go's single-binary distribution shines here.
+
+### 25.2 What Go does **not** do well
+
+- **Training.** Use PyTorch / JAX / TensorFlow in Python. Don't try to reproduce them in Go.
+- **Custom CUDA kernels.** Use C++/CUDA. Wrap with a C++ binary your Go code shells out to or talks to over gRPC.
+- **Heavy numerical preprocessing.** NumPy / cuPy / Pandas / Polars / Arrow in Python or Rust. Go's stdlib has no good numerical computing story; `gonum` is fine for moderate work but not the right call here.
+- **Direct CUDA from CGO** (with a few exceptions). Possible but painful — bindings exist (`gocuda`, custom wrappers) but the Python ecosystem moves faster than any Go CUDA binding will. Talk to a CUDA process over gRPC instead.
+
+### 25.3 NVIDIA Triton Inference Server
+
+Triton is NVIDIA's open-source inference server. It hosts models from PyTorch, TensorFlow, ONNX, TensorRT, OpenVINO, Python backends, and others behind a unified HTTP / gRPC API. It handles batching, multiple model versions, ensembles, GPU/CPU scheduling, monitoring.
+
+For Go services that need to call inference, **Triton's gRPC API is the right interface**. NVIDIA publishes the `.proto` files and example Go client code — generate your own client with `protoc-gen-go` + `protoc-gen-go-grpc`:
+
+```bash
+protoc --go_out=. --go-grpc_out=. \
+  --go_opt=paths=source_relative \
+  --go-grpc_opt=paths=source_relative \
+  grpc_service.proto model_config.proto
+```
+
+Then use the generated client like any other gRPC service:
+
+```go
+conn, err := grpc.NewClient("triton:8001", grpc.WithTransportCredentials(insecure.NewCredentials()))
+if err != nil { return fmt.Errorf("grpc dial: %w", err) }
+defer conn.Close()
+client := triton.NewGRPCInferenceServiceClient(conn)
+
+resp, err := client.ModelInfer(ctx, &triton.ModelInferRequest{
+    ModelName:    "bert-base",
+    ModelVersion: "1",
+    Inputs:       []*triton.ModelInferRequest_InferInputTensor{ /* ... */ },
+})
+```
+
+Triton on port 8001 is gRPC; port 8000 is HTTP/REST; port 8002 is Prometheus metrics. Use gRPC for high-throughput inference (lower per-call overhead, streaming for sequence models); HTTP for ad-hoc / debugging.
+
+### 25.4 NVIDIA NIM (NVIDIA Inference Microservices)
+
+NIM packages popular models (LLMs, vision, embeddings) as ready-to-deploy containers with optimized inference (TensorRT-LLM under the hood for LLMs). Each NIM exposes a standard OpenAI-compatible REST API plus, for some models, gRPC.
+
+For a Go service consuming a NIM, treat it like any other HTTP API:
+
+- One reusable `*http.Client` with sensible `Transport` settings.
+- Wrap calls in a typed function in `internal/<domain>/nim_client.go`.
+- Add OTel tracing (`otelhttp.NewTransport`) for end-to-end traces from your handler through to the GPU.
+- Honor `ctx` cancellation — long-running generations can be aborted server-side via the OpenAI streaming protocol.
+
+NIM containers can run on any NVIDIA-GPU host: ECS / EKS with `g5`/`g6`/`p4`/`p5` instances, on-prem DGX, NVIDIA DGX Cloud, partner clouds (Lambda Labs, CoreWeave, RunPod), or self-hosted with the NVIDIA Container Toolkit.
+
+### 25.5 NVIDIA DGX Cloud and Cloud Functions (NVCF)
+
+For workloads that need GPUs but you don't want to manage capacity:
+
+- **DGX Cloud Lepton / DGX Cloud Create** — managed multi-tenant GPU clusters, accessible through partnerships with hyperscalers (AWS, Azure, GCP, Oracle). Pay for capacity.
+- **NVIDIA Cloud Functions (NVCF)** — serverless inference. You upload a container (often a NIM); NVCF auto-scales it across GPU clusters. Invocation API is HTTP / gRPC. Cold starts exist; for low-latency paths, use provisioned capacity. Good fit when traffic is bursty or you want to avoid running idle GPUs.
+
+From Go's perspective, both are "an HTTP/gRPC endpoint that performs inference". Wrap with a typed client; include auth (NVCF uses API keys); set timeouts generously (LLM generations can take seconds); stream responses where the API supports it.
+
+### 25.6 Self-hosting GPU workloads on AWS
+
+If you want to run your own inference server (Triton + your model) on AWS:
+
+- **EC2 GPU instances** (`g5`, `g6`, `g6e`, `p4d`, `p5`, `p5e`, `p6`): direct control, lowest cost per hour, you manage the AMI / drivers / patches. Use the Deep Learning AMI (CUDA + cuDNN + container toolkit pre-installed) or the official NVIDIA AMI.
+- **ECS on EC2 with GPU instances**: ECS schedules tasks onto GPU-enabled hosts. Task definition declares `resourceRequirements: [{ type: GPU, value: "1" }]`. Container automatically gets GPU access via NVIDIA Container Runtime.
+- **EKS with NVIDIA GPU Operator**: Kubernetes-native. The GPU Operator (Go-based, by NVIDIA) installs drivers, container toolkit, monitoring, time-slicing, MIG configuration. Pods request `nvidia.com/gpu: 1` and get scheduled accordingly.
+- **AWS Batch** for offline / training jobs.
+- **SageMaker Inference** if you'd rather AWS manage the serving (SageMaker has its own model formats and SDK; less Go-friendly than self-hosting Triton).
+
+**Fargate does not support GPUs.** For GPU workloads, you're on EC2 (directly, via ECS, or via EKS). Plan capacity accordingly — GPU instances don't scale-from-zero like Fargate does.
+
+### 25.7 NVIDIA Container Toolkit (running GPU containers)
+
+To expose host GPUs to a container, install the **NVIDIA Container Toolkit** on the host and run with the runtime:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+```
+
+For a Go binary that doesn't itself link CUDA but needs to call into a GPU-using sibling process / library (rare in Go):
+
+```dockerfile
+# Multi-stage: build stage uses standard golang image
+FROM golang:1.24 AS build
+# ... build as usual ...
+
+# Runtime stage: NVIDIA CUDA base image
+FROM nvcr.io/nvidia/cuda:12.4.1-base-ubuntu22.04
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/api /api
+USER 65532:65532
+ENTRYPOINT ["/api"]
+```
+
+For most Go services that **don't** call CUDA directly (the common case — they call a separate Triton/NIM container), keep using **distroless**. Your Go container has no GPU dependency; only the inference container needs the CUDA base image and `--gpus`.
+
+### 25.8 CUDA from Go via CGO (rarely the right call)
+
+You can call CUDA from Go via CGO bindings (`gocuda`, `gomlx`, custom). It's **almost always the wrong choice**:
+
+- Build complexity: CGO + CUDA toolchain on every dev machine and CI runner.
+- Debugging: race detector, pprof, and `delve` all degrade or break with heavy CGO.
+- Velocity: the Python ecosystem ships new CUDA features (FlashAttention, FP8, sparse kernels, MoE routing) within weeks of release. Go bindings lag by quarters or years.
+- Operations: a CGO binary loses the "single static binary" appeal — you're back to managing libc, CUDA driver compatibility, runtime libraries.
+
+The right pattern is: **C++ or Python does the CUDA work in a separate process; Go talks to it over gRPC or shared memory.** This keeps your Go service cleanly Go.
+
+The exceptions: a tightly-controlled internal tool where the CUDA call is small and stable, or a niche library where the latency of an extra IPC hop genuinely matters. Both are rare.
+
+### 25.9 GPU observability
+
+NVIDIA's **DCGM (Data Center GPU Manager)** is the standard for GPU telemetry. The companion **`dcgm-exporter`** scrapes DCGM and exposes Prometheus-format metrics: utilization (`DCGM_FI_DEV_GPU_UTIL`), memory (`DCGM_FI_DEV_FB_USED`), SM activity, power draw, temperature, ECC errors.
+
+Run `dcgm-exporter` as a sidecar (ECS) or DaemonSet (EKS). Scrape with your Prometheus, ADOT collector, or CloudWatch agent. Add to OTel traces: when your Go service calls Triton / NIM, attach the upstream model name, version, and (if available) the response's `triton_inference_count` header — this lets you correlate request-level Go traces with GPU-level utilization metrics.
+
+Useful dashboards:
+
+- GPU utilization vs request rate (find utilization gaps to drive batching).
+- GPU memory vs concurrent requests (find OOM headroom).
+- Inference latency p50/p95/p99 by model (regression detection).
+- Cost per inference (request count × hourly GPU cost / GPU count).
+
+### 25.10 Decision matrix: hosting GPU inference
+
+| Need | Best fit |
+|---|---|
+| Bursty / unknown traffic, want zero idle cost | **NVCF** (NVIDIA Cloud Functions) |
+| Steady inference traffic, AWS-native | **EC2 G5/G6 + ECS + Triton** or **EKS + GPU Operator + Triton** |
+| Off-the-shelf LLM behind an API | **NIM** (self-hosted on EC2 / EKS, or via DGX Cloud) |
+| Multi-tenant managed GPUs across clouds | **DGX Cloud** |
+| Training / batch jobs | **AWS Batch + EC2 G6/P5** or **SageMaker Training** |
+| Lowest cost per hour, willing to manage | **CoreWeave / Lambda Labs / RunPod** (often cheaper than hyperscalers for raw GPU) |
+| AWS-managed end-to-end | **SageMaker Inference** (less Go-friendly; SDK is Python-first) |
+
+### 25.11 Architecture choice for GPU hosts
+
+GPU hosts are predominantly **amd64**. CUDA on arm64 is well-supported on Jetson and the Grace family (Grace Hopper, Grace Blackwell), but most data-center GPU instances in AWS / Azure / GCP today are amd64. Default to **`GOARCH=amd64`** for any Go binary that runs on a GPU host or directly interacts with CUDA libraries — even if your sibling Go services run arm64 elsewhere. Multi-arch images are an option if you want a single image for both fleets.
+
+---
+
 ## Appendix: Recommended Reading
 
 - [Effective Go](https://go.dev/doc/effective_go) — the canonical idioms guide. Read once a year.
@@ -1964,6 +2195,13 @@ Match `CLAUDE.md`'s checklist; expanded reasoning here:
 - [sqlc documentation](https://docs.sqlc.dev/) — query generator reference.
 - [OpenTelemetry Go docs](https://opentelemetry.io/docs/languages/go/) — SDK, instrumentation, semantic conventions.
 - [`go.dev/security/best-practices`](https://go.dev/doc/security/best-practices) — official security guide.
+- [NVIDIA Triton Inference Server](https://github.com/triton-inference-server/server) — open-source inference server; Go gRPC client examples in [triton-inference-server/client](https://github.com/triton-inference-server/client).
+- [NVIDIA NIM Microservices](https://www.nvidia.com/en-us/ai-data-science/products/nim-microservices/) — packaged inference containers.
+- [NVIDIA Cloud Functions (NVCF)](https://developer.nvidia.com/dgx-cloud/nvcf) — serverless GPU inference.
+- [NVIDIA DGX Cloud](https://www.nvidia.com/en-us/data-center/dgx-cloud/) — managed GPU clusters via hyperscaler partners.
+- [NVIDIA GPU Operator](https://github.com/NVIDIA/gpu-operator) — Kubernetes operator (written in Go) for GPU lifecycle management.
+- [NVIDIA Container Toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) — runtime for exposing GPUs to containers.
+- [DCGM and `dcgm-exporter`](https://github.com/NVIDIA/dcgm-exporter) — GPU telemetry exposed as Prometheus metrics.
 
 ---
 
